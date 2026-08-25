@@ -1,0 +1,11 @@
+## IDF Component Manager Manifest File
+dependencies:
+  78/esp-opus: ^1.0.5
+  lierda-iot/esp_lora_driver:
+    version: "0.0.7"
+    registry_url: https://components-staging.espressif.com
+  idf: "5.5.3"
+  lvgl/lvgl: ^8.4.0
+  espressif/esp_new_jpeg: "^0.6.0"
+  espressif/esp_cam_sensor: "^1.1.0"
+  espressif/esp_image_effects: "^1.0.0"
