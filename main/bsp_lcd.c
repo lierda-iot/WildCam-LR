@@ -17,8 +17,12 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "hal/gpio_ll.h"
+#include "hal/spi_ll.h"
+#include "soc/gpio_struct.h"
 #include "lvgl.h"
 
 #include "app_config.h"
@@ -29,9 +33,25 @@ static const char *TAG = "bsp_lcd";
 #define BSP_LCD_SPI_HOST SPI3_HOST
 #define LCD_FLUSH_TIMEOUT_MS 200U
 #define LCD_FLUSH_WATCHDOG_PERIOD_MS 25U
+#define LCD_DMA_ALIGNMENT 64U
+#define LCD_PIXEL_DUTY_CYCLE_POS APP_LCD_SPI_PIXEL_DUTY_CYCLE_POS
 
+/* Split-speed SPI on the DK01 LCD link. s_lcd_io is the esp_lcd panel IO at
+ * APP_LCD_SPI_CMD_PCLK_HZ for init and the CASET/RASET/RAMWR window commands;
+ * s_lcd_pixel_spi is a raw spi_master device at APP_LCD_SPI_PCLK_HZ with a
+ * custom duty cycle for the RGB565 DMA (esp_lcd does not expose duty_cycle_pos).
+ * CS is driven by software: low from the window command through the last pixel
+ * chunk, raised once that chunk is done. Both devices use polling transactions
+ * only; a queued/ISR pixel device next to a polling command device can lose a
+ * wakeup in the IDF bus lock and stall a flush. The pixel DMA is started with
+ * spi_device_polling_start() and left in flight while LVGL renders the next
+ * band; the next draw or the end of the frame collects it. */
 static esp_lcd_panel_io_handle_t s_lcd_io;
+static spi_device_handle_t s_lcd_pixel_spi;
 static esp_lcd_panel_handle_t s_lcd_panel;
+static size_t s_lcd_pixel_max_transfer_bytes;
+static bool s_lcd_pixel_inflight;
+static spi_transaction_t s_lcd_pixel_transaction;
 static bool s_lcd_bus_ready;
 static bool s_lcd_ready;
 static bool s_lvgl_started;
@@ -64,14 +84,60 @@ typedef struct {
     uint16_t delay_ms;
 } lcd_init_cmd_t;
 
+/* Internal DMA RAM, cache-line aligned so pixel chunks split on max_transfer
+ * never start mid-line. */
+static void *lcd_alloc_internal_dma(size_t bytes)
+{
+    return heap_caps_aligned_alloc(
+        LCD_DMA_ALIGNMENT, bytes,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+}
+
+static inline void lcd_cs_select(void)
+{
+    gpio_set_level(BSP_LCD_SPI_CS_GPIO, 0);
+}
+
+static inline void lcd_cs_deselect(void)
+{
+    gpio_set_level(BSP_LCD_SPI_CS_GPIO, 1);
+}
+
 static esp_err_t lcd_tx_cmd(uint8_t cmd, const uint8_t *data, size_t len)
 {
     ESP_RETURN_ON_FALSE(s_lcd_io, ESP_ERR_INVALID_STATE, TAG, "lcd io not ready");
+    lcd_cs_select();
     esp_err_t ret = esp_lcd_panel_io_tx_param(s_lcd_io, cmd, data, len);
+    lcd_cs_deselect();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "lcd_tx_cmd(0x%02X) FAILED: %s", cmd, esp_err_to_name(ret));
     }
     return ret;
+}
+
+/* Same registers the IDF ST7789 driver programs in esp_lcd_panel_init(), sent
+ * one command per CS window on the 10 MHz IO. RAMCTRL 0xF8 puts the panel in
+ * little-endian RGB565 so LVGL's native buffer can be DMA'd without a
+ * per-pixel byte swap. */
+static esp_err_t lcd_panel_init_low_speed(void)
+{
+    static const uint8_t madctl = LCD_CMD_BGR_BIT;
+    static const uint8_t colmod = 0x55;
+    static const uint8_t ramctrl[] = {0x00, 0xf8};
+
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_SWRESET, NULL, 0),
+                        TAG, "low-speed SWRESET");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_SLPOUT, NULL, 0),
+                        TAG, "low-speed SLPOUT");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_MADCTL, &madctl, 1),
+                        TAG, "low-speed MADCTL");
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(LCD_CMD_COLMOD, &colmod, 1),
+                        TAG, "low-speed COLMOD");
+    ESP_RETURN_ON_ERROR(lcd_tx_cmd(0xb0, ramctrl, sizeof(ramctrl)),
+                        TAG, "low-speed RAMCTRL");
+    return ESP_OK;
 }
 
 static esp_err_t touch_read_reg(uint8_t reg, uint8_t *data, size_t len)
@@ -158,17 +224,121 @@ static void lvgl_tick_cb(void *arg)
     lv_tick_inc(APP_LCD_LVGL_TICK_MS);
 }
 
+/* Collect the pixel transfer left in flight by the previous draw: wait for
+ * the DMA to finish and raise CS. On timeout the transfer stays marked in
+ * flight so the flush watchdog sees it. */
+static esp_err_t lcd_pixel_wait_done(void)
+{
+    if (!s_lcd_pixel_inflight) {
+        return ESP_OK;
+    }
+    esp_err_t ret = spi_device_polling_end(s_lcd_pixel_spi,
+                                           pdMS_TO_TICKS(LCD_FLUSH_TIMEOUT_MS));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "pixel transfer did not finish: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    s_lcd_pixel_inflight = false;
+    lcd_cs_deselect();
+    return ESP_OK;
+}
+
+/* Send color_size bytes of RGB565 on the pixel device. Chunks that exceed
+ * one DMA transfer are sent synchronously; the last (normally the only)
+ * chunk is started and left in flight for lcd_pixel_wait_done(). The source
+ * must be internal DMA RAM (LVGL draw buffers and the test pattern are
+ * allocated that way). */
+static esp_err_t lcd_pixel_tx_color(const void *color, size_t color_size)
+{
+    ESP_RETURN_ON_FALSE(s_lcd_pixel_spi && color && color_size > 0,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid pixel transfer");
+    ESP_RETURN_ON_FALSE(s_lcd_pixel_max_transfer_bytes > 0,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "pixel max transfer size unavailable");
+    ESP_RETURN_ON_FALSE(esp_ptr_dma_capable(color), ESP_ERR_INVALID_ARG, TAG,
+                        "pixel source %p is not internal DMA memory", color);
+    ESP_RETURN_ON_FALSE(!s_lcd_pixel_inflight, ESP_ERR_INVALID_STATE, TAG,
+                        "previous pixel transfer still in flight");
+
+    gpio_ll_set_level(&GPIO, BSP_LCD_SPI_DC_GPIO, 1);
+    gpio_ll_output_enable(&GPIO, BSP_LCD_SPI_DC_GPIO);
+
+    const uint8_t *chunk = color;
+    size_t remaining = color_size;
+    while (remaining > 0) {
+        const size_t chunk_size = remaining > s_lcd_pixel_max_transfer_bytes
+                                      ? s_lcd_pixel_max_transfer_bytes
+                                      : remaining;
+        spi_transaction_t *trans = &s_lcd_pixel_transaction;
+        memset(trans, 0, sizeof(*trans));
+        trans->length = chunk_size * 8U;
+        trans->tx_buffer = chunk;
+        chunk += chunk_size;
+        remaining -= chunk_size;
+
+        if (remaining > 0) {
+            ESP_RETURN_ON_ERROR(spi_device_polling_transmit(s_lcd_pixel_spi, trans),
+                                TAG, "pixel chunk");
+        } else {
+            ESP_RETURN_ON_ERROR(
+                spi_device_polling_start(s_lcd_pixel_spi, trans, portMAX_DELAY),
+                TAG, "start pixel transfer");
+            s_lcd_pixel_inflight = true;
+        }
+    }
+    return ESP_OK;
+}
+
+/* Window commands plus pixel data. Returns with the pixel DMA in flight;
+ * the caller must call lcd_pixel_wait_done() before touching the bus or
+ * the pixel buffer again. */
 static esp_err_t lcd_draw_rgb565_bitmap(uint32_t x0, uint32_t y0,
                                         uint32_t x1, uint32_t y1,
                                         const uint16_t *pixels)
 {
-    ESP_RETURN_ON_FALSE(s_lcd_ready && pixels, ESP_ERR_INVALID_STATE, TAG,
-                        "lcd not ready");
+    ESP_RETURN_ON_FALSE(s_lcd_ready && s_lcd_io && s_lcd_pixel_spi && pixels,
+                        ESP_ERR_INVALID_STATE, TAG, "lcd not ready");
     ESP_RETURN_ON_FALSE(x1 > x0 && y1 > y0 &&
                         x1 <= APP_LCD_H_RES && y1 <= APP_LCD_V_RES,
                         ESP_ERR_INVALID_ARG, TAG, "invalid draw area");
+    ESP_RETURN_ON_FALSE(!s_lcd_pixel_inflight, ESP_ERR_INVALID_STATE, TAG,
+                        "previous LCD pixel transfer not collected");
 
-    return esp_lcd_panel_draw_bitmap(s_lcd_panel, x0, y0, x1, y1, pixels);
+    const uint32_t x_start = x0 + APP_LCD_X_GAP;
+    const uint32_t x_end = x1 + APP_LCD_X_GAP;
+    const uint32_t y_start = y0 + APP_LCD_Y_GAP;
+    const uint32_t y_end = y1 + APP_LCD_Y_GAP;
+    const uint8_t caset[] = {
+        (uint8_t)(x_start >> 8), (uint8_t)x_start,
+        (uint8_t)((x_end - 1U) >> 8), (uint8_t)(x_end - 1U),
+    };
+    const uint8_t raset[] = {
+        (uint8_t)(y_start >> 8), (uint8_t)y_start,
+        (uint8_t)((y_end - 1U) >> 8), (uint8_t)(y_end - 1U),
+    };
+    const size_t color_bytes =
+        (size_t)(x1 - x0) * (size_t)(y1 - y0) * sizeof(uint16_t);
+
+    /* CS stays low across the three window commands and the pixel data;
+     * lcd_pixel_wait_done() raises it. */
+    lcd_cs_select();
+    esp_err_t ret = esp_lcd_panel_io_tx_param(s_lcd_io, LCD_CMD_CASET,
+                                               caset, sizeof(caset));
+    if (ret == ESP_OK) {
+        ret = esp_lcd_panel_io_tx_param(s_lcd_io, LCD_CMD_RASET,
+                                        raset, sizeof(raset));
+    }
+    if (ret == ESP_OK) {
+        ret = esp_lcd_panel_io_tx_param(s_lcd_io, LCD_CMD_RAMWR, NULL, 0);
+    }
+    if (ret == ESP_OK) {
+        ret = lcd_pixel_tx_color(pixels, color_bytes);
+    }
+    if (ret != ESP_OK) {
+        lcd_cs_deselect();
+        ESP_LOGE(TAG, "split-speed LCD draw failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 static void lcd_flush_watchdog_cb(void *arg)
@@ -194,6 +364,15 @@ static void lcd_flush_watchdog_cb(void *arg)
      * race with this timer, but a transfer that exceeded the deadline is no
      * longer safe to recover by releasing LVGL's draw buffer. */
     if (s_pending_flush_drv != drv || s_pending_flush_seq != seq) {
+        return;
+    }
+
+    /* A band stays pending until the LVGL task collects it in the next
+     * flush_cb. If the pixel DMA has already finished on the wire, the LVGL
+     * task is merely late (starved by a higher-priority task on its core),
+     * not stuck on the bus; only a transfer still running after the deadline
+     * is a real SPI hang. */
+    if (s_lcd_pixel_inflight && spi_ll_usr_is_done(SPI_LL_GET_HW(BSP_LCD_SPI_HOST))) {
         return;
     }
 
@@ -245,27 +424,32 @@ static void mark_flush_completed(uint32_t flush_seq)
     }
 }
 
-static bool lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
-                                    esp_lcd_panel_io_event_data_t *event_data,
-                                    void *user_ctx)
+/* Collect the LVGL band left in flight by the previous flush_cb and report it
+ * as physically complete. Returns false if it is still stuck on the bus. */
+static bool lvgl_finish_pending_flush(void)
 {
-    (void)panel_io;
-    (void)event_data;
-    (void)user_ctx;
-
-    lv_disp_drv_t *drv = s_pending_flush_drv;
-    if (drv != NULL) {
-        uint32_t flush_seq = s_pending_flush_seq;
-        s_pending_flush_drv = NULL;
-        lv_disp_flush_ready(drv);
-        mark_flush_completed(flush_seq);
+    if (s_pending_flush_drv == NULL) {
+        return true;
     }
-    return false;
+    if (lcd_pixel_wait_done() != ESP_OK) {
+        return false;
+    }
+    s_pending_flush_drv = NULL;
+    mark_flush_completed(s_pending_flush_seq);
+    return true;
 }
 
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                           lv_color_t *color_map)
 {
+    /* The previous band's DMA may still be reading the other draw buffer;
+     * it must be done before LVGL renders into that buffer again. A stuck
+     * band is left to the flush watchdog. */
+    if (!lvgl_finish_pending_flush()) {
+        lv_disp_flush_ready(drv);
+        return;
+    }
+
     uint32_t flush_seq = s_pending_flush_seq + 1U;
     s_pending_flush_seq = flush_seq;
 
@@ -274,11 +458,8 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
         mark_flush_completed(flush_seq);
         return;
     }
-    uint32_t pixel_count = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
-    uint16_t *px = (uint16_t *)color_map;
-    for (uint32_t i = 0; i < pixel_count; i++) {
-        px[i] = (px[i] >> 8) | (px[i] << 8);
-    }
+    /* No byte swap: the panel runs little-endian (RAMCTRL 0xF8), matching
+     * LVGL's native RGB565 layout. */
     s_pending_flush_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_pending_flush_y1 = area->y1;
     s_pending_flush_y2 = area->y2;
@@ -287,13 +468,20 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                                            area->x2 + 1, area->y2 + 1,
                                            (const uint16_t *)color_map);
     if (err != ESP_OK) {
-        if (s_pending_flush_drv == drv) {
-            s_pending_flush_drv = NULL;
-        }
+        s_pending_flush_drv = NULL;
         ESP_LOGE(TAG, "lvgl flush failed: %s", esp_err_to_name(err));
         lv_disp_flush_ready(drv);
         mark_flush_completed(flush_seq);
+        return;
     }
+
+    /* Last band of the refresh: no later flush will collect it. */
+    if (lv_disp_flush_is_last(drv)) {
+        (void)lvgl_finish_pending_flush();
+    }
+    /* Double-buffered: LVGL renders the next band into the other buffer
+     * while this one is still on the wire. */
+    lv_disp_flush_ready(drv);
 }
 
 static void lvgl_monitor_cb(lv_disp_drv_t *drv, uint32_t time_ms,
@@ -306,9 +494,9 @@ static void lvgl_monitor_cb(lv_disp_drv_t *drv, uint32_t time_ms,
     uint32_t refresh_seq = s_refresh_started_seq + 1U;
     uint32_t last_flush_seq = s_pending_flush_seq;
 
-    /* Publish the final flush sequence before the refresh sequence. The DMA
-     * callback can then close the same refresh whether it runs just before or
-     * just after this monitor callback. */
+    /* Publish the final flush sequence before the refresh sequence, so
+     * mark_flush_completed() can close this refresh whether the last band is
+     * collected just before or just after this monitor callback. */
     s_monitored_last_flush_seq = last_flush_seq;
     s_monitored_refresh_seq = refresh_seq;
     s_refresh_started_seq = refresh_seq;
@@ -569,24 +757,88 @@ esp_err_t bsp_lcd_init(void)
                  BSP_LCD_SPI_SCLK_GPIO, BSP_LCD_SPI_MOSI_GPIO);
     }
 
-    esp_lcd_panel_io_spi_config_t io_cfg = {
-        .cs_gpio_num = BSP_LCD_SPI_CS_GPIO,
+    /* Software CS: neither SPI device owns the pin. */
+    gpio_config_t cs_cfg = {
+        .pin_bit_mask = 1ULL << BSP_LCD_SPI_CS_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&cs_cfg), TAG, "lcd manual cs gpio");
+    lcd_cs_deselect();
+
+    const esp_lcd_panel_io_spi_config_t cmd_io_cfg = {
+        .cs_gpio_num = -1,
         .dc_gpio_num = BSP_LCD_SPI_DC_GPIO,
         .spi_mode = 0,
-        .pclk_hz = APP_LCD_SPI_PCLK_HZ,
-        .trans_queue_depth = APP_LCD_SPI_QUEUE_DEPTH,
-        .on_color_trans_done = lcd_color_trans_done_cb,
-        .user_ctx = NULL,
+        .pclk_hz = APP_LCD_SPI_CMD_PCLK_HZ,
+        .trans_queue_depth = 1,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
     };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)BSP_LCD_SPI_HOST,
-                                                 &io_cfg, &s_lcd_io),
-                        TAG, "panel io");
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi(
+                            (esp_lcd_spi_bus_handle_t)BSP_LCD_SPI_HOST,
+                            &cmd_io_cfg, &s_lcd_io),
+                        TAG, "low-speed command panel io");
 
+    const spi_device_interface_config_t pixel_dev_cfg = {
+        .mode = 0,
+        .duty_cycle_pos = LCD_PIXEL_DUTY_CYCLE_POS,
+        .clock_speed_hz = APP_LCD_SPI_PCLK_HZ,
+        .spics_io_num = -1,
+        .flags = SPI_DEVICE_HALFDUPLEX,
+        .queue_size = APP_LCD_SPI_QUEUE_DEPTH,
+    };
+    ESP_RETURN_ON_ERROR(
+        spi_bus_add_device(BSP_LCD_SPI_HOST, &pixel_dev_cfg, &s_lcd_pixel_spi),
+        TAG, "pixel SPI device");
+    ESP_RETURN_ON_ERROR(
+        spi_bus_get_max_transaction_len(BSP_LCD_SPI_HOST,
+                                        &s_lcd_pixel_max_transfer_bytes),
+        TAG, "pixel max transaction length");
+
+    /* The bus rounds max_transfer_sz up to whole 4092-byte DMA descriptors
+     * (19200 -> 20460). Clamp back to the configured 40-line chunk and mask
+     * to the cache line so every chunk boundary stays aligned. */
+    const size_t configured_transfer_bytes =
+        APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS * sizeof(uint16_t);
+    if (s_lcd_pixel_max_transfer_bytes > configured_transfer_bytes) {
+        s_lcd_pixel_max_transfer_bytes = configured_transfer_bytes;
+    }
+    s_lcd_pixel_max_transfer_bytes &= ~(size_t)(LCD_DMA_ALIGNMENT - 1U);
+    ESP_RETURN_ON_FALSE(s_lcd_pixel_max_transfer_bytes > 0,
+                        ESP_ERR_INVALID_SIZE, TAG,
+                        "pixel transfer size collapsed after alignment");
+    s_lcd_pixel_inflight = false;
+
+    ESP_RETURN_ON_ERROR(
+        gpio_set_drive_capability(BSP_LCD_SPI_SCLK_GPIO,
+                                  (gpio_drive_cap_t)APP_LCD_SPI_SCLK_DRIVE_CAP),
+        TAG, "lcd sclk drive capability");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_drive_capability(BSP_LCD_SPI_MOSI_GPIO,
+                                  (gpio_drive_cap_t)APP_LCD_SPI_MOSI_DRIVE_CAP),
+        TAG, "lcd mosi drive capability");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_drive_capability(BSP_LCD_SPI_CS_GPIO,
+                                  (gpio_drive_cap_t)APP_LCD_SPI_CS_DRIVE_CAP),
+        TAG, "lcd cs drive capability");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_drive_capability(BSP_LCD_SPI_DC_GPIO,
+                                  (gpio_drive_cap_t)APP_LCD_SPI_DC_DRIVE_CAP),
+        TAG, "lcd dc drive capability");
+
+    ESP_LOGI(TAG, "LCD SPI: commands %u Hz, pixels %u Hz duty %u/256, drive cap %u",
+             (unsigned)APP_LCD_SPI_CMD_PCLK_HZ, (unsigned)APP_LCD_SPI_PCLK_HZ,
+             (unsigned)LCD_PIXEL_DUTY_CYCLE_POS, (unsigned)APP_LCD_SPI_SCLK_DRIVE_CAP);
+
+    /* The panel object only supplies the invert/on-off helpers; init and
+     * pixel writes bypass it (see lcd_panel_init_low_speed). */
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = -1,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
         .bits_per_pixel = 16,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(s_lcd_io, &panel_cfg, &s_lcd_panel),
@@ -597,13 +849,10 @@ esp_err_t bsp_lcd_init(void)
     ESP_LOGI(TAG, "lcd_reset_gpio: %s", esp_err_to_name(ret));
     ESP_RETURN_ON_ERROR(ret, TAG, "lcd hw reset");
 
-    ret = esp_lcd_panel_reset(s_lcd_panel);
-    ESP_LOGI(TAG, "esp_lcd_panel_reset: %s", esp_err_to_name(ret));
-    ESP_RETURN_ON_ERROR(ret, TAG, "lcd sw reset");
-
-    ret = esp_lcd_panel_init(s_lcd_panel);
-    ESP_LOGI(TAG, "esp_lcd_panel_init: %s", esp_err_to_name(ret));
-    ESP_RETURN_ON_ERROR(ret, TAG, "lcd init");
+    ret = lcd_panel_init_low_speed();
+    ESP_LOGI(TAG, "lcd_panel_init_low_speed (%u Hz): %s",
+             (unsigned)APP_LCD_SPI_CMD_PCLK_HZ, esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "lcd low-speed init");
 
     vTaskDelay(pdMS_TO_TICKS(120));
 
@@ -611,11 +860,15 @@ esp_err_t bsp_lcd_init(void)
     ESP_LOGI(TAG, "esp_lcd_panel_set_gap: %s", esp_err_to_name(ret));
     ESP_RETURN_ON_ERROR(ret, TAG, "lcd gap");
 
+    lcd_cs_select();
     ret = esp_lcd_panel_invert_color(s_lcd_panel, true);
+    lcd_cs_deselect();
     ESP_LOGI(TAG, "esp_lcd_panel_invert_color: %s", esp_err_to_name(ret));
     ESP_RETURN_ON_ERROR(ret, TAG, "lcd invert");
 
+    lcd_cs_select();
     ret = esp_lcd_panel_disp_on_off(s_lcd_panel, true);
+    lcd_cs_deselect();
     ESP_LOGI(TAG, "esp_lcd_panel_disp_on_off: %s", esp_err_to_name(ret));
     ESP_RETURN_ON_ERROR(ret, TAG, "lcd on");
     bl_err = bsp_ioexp_set_pin(BSP_IO_EXP_LCD_BL_PIN, true);
@@ -639,10 +892,30 @@ esp_err_t bsp_lcd_release_for_camera(void)
     s_lcd_suspended = true;
     vTaskDelay(pdMS_TO_TICKS(40));
 
+    /* flush_cb is suspended; collect any band it left in flight. */
+    ESP_RETURN_ON_FALSE(lvgl_finish_pending_flush(), ESP_ERR_TIMEOUT, TAG,
+                        "LCD pixel transfer still active during release");
+    ESP_RETURN_ON_ERROR(lcd_pixel_wait_done(), TAG,
+                        "LCD pixel transfer still active during release");
+
     if (s_lcd_panel) {
+        lcd_cs_select();
         esp_lcd_panel_disp_on_off(s_lcd_panel, false);
+        lcd_cs_deselect();
         esp_lcd_panel_del(s_lcd_panel);
         s_lcd_panel = NULL;
+        s_lcd_ready = false;
+    }
+    if (s_lcd_pixel_spi) {
+        esp_err_t err = spi_bus_remove_device(s_lcd_pixel_spi);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "pixel SPI device removal failed: %s",
+                     esp_err_to_name(err));
+        } else {
+            s_lcd_pixel_spi = NULL;
+            s_lcd_pixel_max_transfer_bytes = 0;
+            s_lcd_pixel_inflight = false;
+        }
         s_lcd_ready = false;
     }
     if (s_lcd_io) {
@@ -650,6 +923,7 @@ esp_err_t bsp_lcd_release_for_camera(void)
         s_lcd_io = NULL;
         s_lcd_ready = false;
     }
+    lcd_cs_deselect();
     if (s_lcd_bus_ready) {
         esp_err_t err = spi_bus_free(BSP_LCD_SPI_HOST);
         if (err != ESP_OK) {
@@ -682,14 +956,14 @@ esp_err_t bsp_lcd_show_test_pattern(void)
 
     const size_t rows = APP_LCD_TEST_PATTERN_ROWS;
     const size_t pixels = APP_LCD_H_RES * rows;
-    uint16_t *line = heap_caps_malloc(pixels * sizeof(uint16_t),
-                                      MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    uint16_t *line = lcd_alloc_internal_dma(pixels * sizeof(uint16_t));
     if (!line) {
         return ESP_ERR_NO_MEM;
     }
 
+    /* Native little-endian RGB565; the panel runs RAMCTRL 0xF8. */
     static const uint16_t colors[] = {
-        0x00f8, 0xe007, 0x1f00, 0xe0ff, 0xff07, 0x1ff8, 0xffff, 0x0000,
+        0xf800, 0x07e0, 0x001f, 0xffe0, 0x07ff, 0xf81f, 0xffff, 0x0000,
     };
     for (uint32_t y = 0; y < APP_LCD_V_RES; y += rows) {
         uint32_t draw_rows = APP_LCD_V_RES - y;
@@ -706,6 +980,11 @@ esp_err_t bsp_lcd_show_test_pattern(void)
                                                y + draw_rows, line);
         if (y == 0) {
             ESP_LOGI(TAG, "first draw_bitmap (y=0..%lu): %s", (unsigned long)draw_rows, esp_err_to_name(err));
+        }
+        if (err == ESP_OK) {
+            /* The line buffer is refilled for the next band; wait for the
+             * DMA to release it. */
+            err = lcd_pixel_wait_done();
         }
         if (err != ESP_OK) {
             heap_caps_free(line);
@@ -735,10 +1014,8 @@ esp_err_t bsp_lcd_start_lvgl_demo(void)
     lv_init();
 
     const size_t pixels = APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS;
-    lv_color_t *buf1 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lv_color_t *buf1 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
+    lv_color_t *buf2 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
     if (!buf1 || !buf2) {
         heap_caps_free(buf1);
         heap_caps_free(buf2);
@@ -820,10 +1097,8 @@ esp_err_t bsp_lcd_start_camera_ui(bsp_lcd_capture_cb_t cb, void *user)
     lv_init();
 
     const size_t pixels = APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS;
-    lv_color_t *buf1 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lv_color_t *buf1 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
+    lv_color_t *buf2 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
     if (!buf1 || !buf2) {
         heap_caps_free(buf1);
         heap_caps_free(buf2);
@@ -906,10 +1181,8 @@ esp_err_t bsp_lcd_start_gateway_ui(void)
     lv_init();
 
     const size_t pixels = APP_LCD_H_RES * APP_LCD_LVGL_BUFFER_ROWS;
-    lv_color_t *buf1 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_malloc(pixels * sizeof(lv_color_t),
-                                        MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    lv_color_t *buf1 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
+    lv_color_t *buf2 = lcd_alloc_internal_dma(pixels * sizeof(lv_color_t));
     if (!buf1 || !buf2) {
         heap_caps_free(buf1);
         heap_caps_free(buf2);

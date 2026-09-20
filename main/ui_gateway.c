@@ -84,6 +84,7 @@ typedef enum {
     UI_EVENT_RX_EOT_STATS,
     UI_EVENT_VBAT,
     UI_EVENT_FREQUENCY_RESULT,
+    UI_EVENT_FREQUENCY_RESET_PROGRESS,
 } ui_event_type_t;
 
 typedef struct {
@@ -108,6 +109,7 @@ static ui_page_t s_page = UI_PAGE_IMAGE;
 static ui_gw_capture_cb_t s_capture_cb = NULL;
 static ui_gw_interval_cb_t s_interval_cb = NULL;
 static ui_gw_frequency_cb_t s_frequency_cb = NULL;
+static ui_gw_frequency_reset_cb_t s_frequency_reset_cb = NULL;
 static SemaphoreHandle_t s_lock = NULL; // points to bsp_lcd's LVGL lock
 static QueueHandle_t s_ui_event_queue = NULL;
 static lv_timer_t *s_ui_event_timer = NULL;
@@ -120,6 +122,20 @@ static int s_cfg_interval_idx = 4; /* default = 5 min */
 static const uint32_t s_frequency_presets[] = APP_FLRC_FREQUENCY_PRESETS_HZ;
 static int s_cfg_frequency_idx = 0;
 static bool s_frequency_change_busy = false;
+
+/* Config-page control indices for the frequency group. The two reset buttons
+ * use a two-tap confirm: the first tap arms the button ("SURE?"), the second
+ * tap within RESET_ARM_TIMEOUT_MS starts the sweep. */
+#define CFG_IDX_FREQUENCY       8
+#define CFG_IDX_FREQ_RESET      9
+#define CFG_IDX_FREQ_RESET_LP   10
+#define CFG_CTRL_COUNT          11
+#define RESET_ARM_TIMEOUT_MS    5000U
+static int s_reset_armed_idx = -1;
+static uint32_t s_reset_armed_until_ms = 0;
+/* True while the busy operation is a reset sweep rather than a preset change,
+ * so the result chip can say "NO NODE" (gateway reset anyway) instead of FAIL. */
+static bool s_reset_in_progress = false;
 
 /* Latest node (camera) battery voltage in mV, 0 = unknown. Shown in status bar right. */
 static uint16_t s_node_vbat_mv = 0;
@@ -181,8 +197,8 @@ static uint16_t s_stats_total_retransmitted = 0;
 static bool s_stats_first_eot_seen = false;
 
 /* PAGE_CONFIG objects */
-static lv_obj_t *s_cfg_touch_btns[9] = {NULL};
-static lv_obj_t *s_cfg_touch_lbls[9] = {NULL};
+static lv_obj_t *s_cfg_touch_btns[CFG_CTRL_COUNT] = {NULL};
+static lv_obj_t *s_cfg_touch_lbls[CFG_CTRL_COUNT] = {NULL};
 static int s_volume_level = 13; /* 0~15, default 13 → 130% */
 static ui_gw_audio_clip_cb_t s_audio_clip_cb = NULL;
 static bool s_audio_clip_on = false;
@@ -588,6 +604,37 @@ static void cfg_format_frequency(char *buf, size_t size, uint32_t frequency_hz)
              (unsigned long)((frequency_hz % 1000000U) / 10000U));
 }
 
+/* Style a reset button as idle ("RESET", green badge) or armed ("SURE?", amber). */
+static void cfg_style_reset_btn(int idx, bool armed)
+{
+    if (!s_cfg_touch_btns[idx] || !s_cfg_touch_lbls[idx]) return;
+    if (armed) {
+        lv_obj_set_style_bg_color(s_cfg_touch_btns[idx], COL_AMBER, 0);
+        lv_obj_set_style_bg_opa(s_cfg_touch_btns[idx], LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(s_cfg_touch_lbls[idx], lv_color_white(), 0);
+        lv_label_set_text(s_cfg_touch_lbls[idx], "SURE?");
+    } else {
+        cfg_style_value(idx, "RESET");
+    }
+}
+
+static void cfg_reset_disarm(void)
+{
+    if (s_reset_armed_idx >= 0) {
+        cfg_style_reset_btn(s_reset_armed_idx, false);
+    }
+    s_reset_armed_idx = -1;
+    s_reset_armed_until_ms = 0;
+}
+
+/* Enable/disable the whole frequency group (preset cycle + both resets). */
+static void cfg_set_frequency_group_enabled(bool enabled)
+{
+    cfg_set_ctrl_enabled(CFG_IDX_FREQUENCY, enabled);
+    cfg_set_ctrl_enabled(CFG_IDX_FREQ_RESET, enabled);
+    cfg_set_ctrl_enabled(CFG_IDX_FREQ_RESET_LP, enabled);
+}
+
 static bool image_present_guard_active(void)
 {
     if (s_image_present_guard_until_ms == 0) return false;
@@ -601,6 +648,11 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
 
+    /* Any tap outside the reset buttons cancels a pending reset confirm. */
+    if (idx != CFG_IDX_FREQ_RESET && idx != CFG_IDX_FREQ_RESET_LP) {
+        cfg_reset_disarm();
+    }
+
     switch (idx) {
     case 0: /* Capture */
         /* Ignore the key entirely while a transfer is already running: don't
@@ -613,6 +665,11 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
         if (s_capture_cb) {
             show_page(UI_PAGE_RX);
             if (s_capture_cb()) {
+                /* In low-power mode the callback blocks on the LoRa wakeup
+                 * preamble (~0.6 s) before this task can render the page.
+                 * Restart the comfort progress so the bar begins at 0 when
+                 * the first frame is drawn instead of mid-way. */
+                start_rx_comfort_progress(0);
                 update_title("Waiting...", "RX", COL_AMBER);
             } else {
                 update_title("Audio preparing...", "WAIT", COL_AMBER);
@@ -659,19 +716,48 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
         }
         break;
     }
-    case 8: /* Frequency preset cycle */ {
+    case CFG_IDX_FREQUENCY: /* Frequency preset cycle */ {
         ESP_LOGW(TAG, "frequency control clicked: busy=%d callback=%d",
                  s_frequency_change_busy, s_frequency_cb != NULL);
         if (s_frequency_change_busy || !s_frequency_cb) break;
         int new_idx = (s_cfg_frequency_idx + 1) % APP_FLRC_FREQUENCY_PRESET_COUNT;
         uint32_t frequency_hz = s_frequency_presets[new_idx];
         s_frequency_change_busy = true;
-        cfg_set_ctrl_enabled(8, false);
+        cfg_set_frequency_group_enabled(false);
         update_title("Settings", "LOADING", COL_AMBER);
         if (!s_frequency_cb(frequency_hz)) {
             s_frequency_change_busy = false;
-            cfg_set_ctrl_enabled(8, true);
+            cfg_set_frequency_group_enabled(true);
             update_title("Settings", "FAIL", COL_VBAT_RED);
+        }
+        break;
+    }
+    case CFG_IDX_FREQ_RESET:    /* Frequency reset (normal) */
+    case CFG_IDX_FREQ_RESET_LP: /* Frequency reset (LoRa wakeup first) */ {
+        bool lora_wakeup = (idx == CFG_IDX_FREQ_RESET_LP);
+        if (s_frequency_change_busy || !s_frequency_reset_cb) break;
+        if (s_reset_armed_idx != idx) {
+            /* First tap (or a tap on the other reset button): arm this one. */
+            cfg_reset_disarm();
+            s_reset_armed_idx = idx;
+            s_reset_armed_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + RESET_ARM_TIMEOUT_MS;
+            cfg_style_reset_btn(idx, true);
+            update_title("Tap again to reset", "CONFIRM", COL_AMBER);
+            break;
+        }
+        /* Second tap: go. */
+        cfg_reset_disarm();
+        ESP_LOGW(TAG, "frequency reset confirmed: wakeup=%d", lora_wakeup);
+        s_frequency_change_busy = true;
+        s_reset_in_progress = true;
+        cfg_set_frequency_group_enabled(false);
+        update_title(lora_wakeup ? "LP Reset: scanning" : "Reset: scanning",
+                     "WAIT", COL_AMBER);
+        if (!s_frequency_reset_cb(lora_wakeup)) {
+            s_frequency_change_busy = false;
+            s_reset_in_progress = false;
+            cfg_set_frequency_group_enabled(true);
+            update_title("Settings", "BUSY", COL_VBAT_RED);
         }
         break;
     }
@@ -985,10 +1071,20 @@ static void create_config_page(void)
     char frequency_buf[16];
     cfg_format_frequency(frequency_buf, sizeof(frequency_buf),
                          s_frequency_presets[s_cfg_frequency_idx]);
-    cfg_create_row(sec_sys, "Frequency", "Node RF channel", 8, NULL);
-    cfg_style_value(8, frequency_buf);
+    cfg_create_row(sec_sys, "Frequency", "Node RF channel", CFG_IDX_FREQUENCY, NULL);
+    cfg_style_value(CFG_IDX_FREQUENCY, frequency_buf);
+
+    cfg_create_row(sec_sys, "Freq Reset", "Scan all, back to CH0", CFG_IDX_FREQ_RESET, NULL);
+    cfg_style_reset_btn(CFG_IDX_FREQ_RESET, false);
+
+    cfg_create_row(sec_sys, "LP Freq Reset", "Wake sleeping node first", CFG_IDX_FREQ_RESET_LP, NULL);
+    cfg_style_reset_btn(CFG_IDX_FREQ_RESET_LP, false);
+
+    /* Page objects were just rebuilt, so no reset button can still be armed. */
+    s_reset_armed_idx = -1;
+    s_reset_armed_until_ms = 0;
     if (s_frequency_change_busy) {
-        cfg_set_ctrl_enabled(8, false);
+        cfg_set_frequency_group_enabled(false);
     }
 
     cfg_create_toggle_row(sec_sys, "Low Power", "CAD sleep standby", 7, s_low_power_on);
@@ -1243,6 +1339,11 @@ void ui_gw_set_frequency_cb(ui_gw_frequency_cb_t cb)
     s_frequency_cb = cb;
 }
 
+void ui_gw_set_frequency_reset_cb(ui_gw_frequency_reset_cb_t cb)
+{
+    s_frequency_reset_cb = cb;
+}
+
 void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
 {
     if (!pressed) return;
@@ -1270,6 +1371,9 @@ void ui_gw_key_event(bsp_btn_id_t key, bool pressed)
                 start_rx_comfort_progress(0);
             }
             if (s_capture_cb()) {
+                /* Same as the touch button: the low-power wakeup preamble
+                 * blocks inside the callback, so restart the bar from 0. */
+                start_rx_comfort_progress(0);
                 update_title("Waiting...", "RX", COL_AMBER);
             } else {
                 update_title("Audio preparing...", "WAIT", COL_AMBER);
@@ -1560,24 +1664,46 @@ static void ui_event_timer_cb(lv_timer_t *t)
             apply_vbat(event.vbat_mv);
         } else if (event.type == UI_EVENT_FREQUENCY_RESULT) {
             s_frequency_change_busy = false;
-            cfg_set_ctrl_enabled(8, true);
-            if (event.success) {
-                for (int i = 0; i < APP_FLRC_FREQUENCY_PRESET_COUNT; ++i) {
-                    if (s_frequency_presets[i] == event.frequency_hz) {
-                        s_cfg_frequency_idx = i;
-                        break;
-                    }
+            cfg_set_frequency_group_enabled(true);
+            /* Show the gateway's real channel whether or not the node followed:
+             * a failed change reverts, a reset always parks on the target. */
+            for (int i = 0; i < APP_FLRC_FREQUENCY_PRESET_COUNT; ++i) {
+                if (s_frequency_presets[i] == event.frequency_hz) {
+                    s_cfg_frequency_idx = i;
+                    break;
                 }
-                char buf[16];
-                cfg_format_frequency(buf, sizeof(buf), event.frequency_hz);
-                cfg_style_value(8, buf);
-                if (s_page == UI_PAGE_CONFIG) {
+            }
+            char buf[16];
+            cfg_format_frequency(buf, sizeof(buf), event.frequency_hz);
+            cfg_style_value(CFG_IDX_FREQUENCY, buf);
+            bool was_reset = s_reset_in_progress;
+            s_reset_in_progress = false;
+            if (s_page == UI_PAGE_CONFIG) {
+                if (event.success) {
                     update_title("Settings", "OK", COL_GREEN);
-                }
-            } else {
-                if (s_page == UI_PAGE_CONFIG) {
+                } else if (was_reset) {
+                    /* Gateway is on CH0 either way; only the node was not found. */
+                    update_title("Reset done, no node", "NO NODE", COL_AMBER);
+                } else {
                     update_title("Settings", "FAIL", COL_VBAT_RED);
                 }
+            }
+        } else if (event.type == UI_EVENT_FREQUENCY_RESET_PROGRESS) {
+            if (s_page == UI_PAGE_CONFIG) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "Reset: scan CH%u/%u",
+                         (unsigned)(event.received + 1), (unsigned)event.total);
+                update_title(buf, "WAIT", COL_AMBER);
+            }
+        }
+    }
+    /* Auto-disarm a reset confirm that was not followed by a second tap. */
+    if (s_reset_armed_idx >= 0) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if ((int32_t)(s_reset_armed_until_ms - now_ms) <= 0) {
+            cfg_reset_disarm();
+            if (s_page == UI_PAGE_CONFIG) {
+                update_title("Settings", "CFG", COL_GREEN);
             }
         }
     }
@@ -1821,6 +1947,16 @@ void ui_gw_frequency_result(bool success, uint32_t frequency_hz)
         .success = success,
     };
     (void)post_important_ui_event(&event);
+}
+
+void ui_gw_frequency_reset_progress(uint8_t channel_index, uint8_t channel_count)
+{
+    const ui_event_t event = {
+        .type = UI_EVENT_FREQUENCY_RESET_PROGRESS,
+        .received = channel_index,
+        .total = channel_count,
+    };
+    (void)post_ui_event(&event);
 }
 void ui_gw_show_qr(const char *payload)
 {

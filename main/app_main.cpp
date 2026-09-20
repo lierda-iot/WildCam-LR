@@ -1303,12 +1303,24 @@ bool on_gw_low_power_change(uint32_t enable)
 
 void on_frequency_change_result(bool success, uint32_t frequency_hz)
 {
-    if (success) {
-        (void)save_frequency_index(frequency_index_from_hz(frequency_hz));
-    }
+    // frequency_hz is the channel the radio is actually on now (a failed change
+    // reverts, a reset always parks on the target), so NVS must track it
+    // regardless of the outcome.
+    (void)save_frequency_index(frequency_index_from_hz(frequency_hz));
     ui_gw_frequency_result(success, frequency_hz);
     ESP_LOGW(TAG, "frequency change finished: %s hz=%lu",
              success ? "OK" : "FAIL", static_cast<unsigned long>(frequency_hz));
+}
+
+void on_frequency_reset_progress(uint8_t channel_index, uint8_t channel_count)
+{
+    ui_gw_frequency_reset_progress(channel_index, channel_count);
+}
+
+bool on_gw_frequency_reset(bool lora_wakeup)
+{
+    ESP_LOGW(TAG, "frequency reset request: wakeup=%d", lora_wakeup);
+    return g_radio.request_frequency_reset(lora_wakeup);
 }
 
 bool on_gw_frequency_change(uint32_t frequency_hz)
@@ -1587,6 +1599,7 @@ extern "C" void app_main(void)
             g_radio.set_config_received_cb(on_config_received);
             g_radio.set_frequency_committed_cb(on_frequency_committed);
             g_radio.set_frequency_change_result_cb(on_frequency_change_result);
+            g_radio.set_frequency_reset_progress_cb(on_frequency_reset_progress);
             g_radio.set_low_power_standby_cb(on_low_power_standby);
         }
         if (g_app_mode == AppMode::radio && radio_ok) {
@@ -1684,6 +1697,7 @@ extern "C" void app_main(void)
                 ui_gw_set_voice_alarm_cb(on_gw_voice_alarm_change);
                 ui_gw_set_low_power_cb(on_gw_low_power_change);
                 ui_gw_set_frequency_cb(on_gw_frequency_change);
+                ui_gw_set_frequency_reset_cb(on_gw_frequency_reset);
                 ui_gw_set_current_frequency(g_radio.current_frequency_hz());
                 ui_gw_set_wifi_prov_cb(on_wifi_prov_request);
                 ui_gw_set_wifi_disconnect_cb(on_wifi_disconnect_request);

@@ -39,7 +39,13 @@ typedef void (*image_rx_error_cb_t)(ImageRxError error);
 typedef void (*image_rx_eot_cb_t)(uint16_t missing_count, bool is_first_eot);
 typedef void (*config_received_cb_t)(uint8_t key, uint32_t value);
 typedef void (*frequency_committed_cb_t)(uint32_t frequency_hz);
+// Called on the gateway when a frequency change or reset finishes.
+// `frequency_hz` is the channel the gateway radio is actually on afterwards
+// (the new channel on success, the previous one after a failed change, the
+// reset target after a reset regardless of outcome).
 typedef void (*frequency_change_result_cb_t)(bool success, uint32_t frequency_hz);
+// Called on the gateway as the reset sweep moves to each preset channel.
+typedef void (*frequency_reset_progress_cb_t)(uint8_t channel_index, uint8_t channel_count);
 // Called on the gateway when a node's battery voltage arrives (via ImageStart
 // or a periodic Vbat broadcast), so the app can push it to the UI.
 typedef void (*vbat_received_cb_t)(uint16_t vbat_mv);
@@ -66,8 +72,8 @@ public:
     // a second transfer request on top of an active one.
     bool image_busy() const { return image_tx_active_ || image_rx_pending_ || image_req_active_; }
     bool frequency_change_busy() const {
-        return frequency_change_request_pending_ || frequency_change_active_ ||
-               frequency_rollback_active_;
+        return frequency_change_request_pending_ || frequency_reset_request_pending_ ||
+               frequency_change_active_ || frequency_rollback_active_;
     }
     // Request image RX cancellation; the radio task performs the serialized teardown.
     void abort_image_rx() { image_rx_abort_req_ = true; }
@@ -86,11 +92,19 @@ public:
     void set_config_received_cb(config_received_cb_t cb) { config_received_cb_ = cb; }
     void set_frequency_committed_cb(frequency_committed_cb_t cb) { frequency_committed_cb_ = cb; }
     void set_frequency_change_result_cb(frequency_change_result_cb_t cb) { frequency_change_result_cb_ = cb; }
+    void set_frequency_reset_progress_cb(frequency_reset_progress_cb_t cb) { frequency_reset_progress_cb_ = cb; }
     void set_low_power_standby_cb(low_power_standby_cb_t cb) { low_power_standby_cb_ = cb; }
     void set_inter_packet_us(uint32_t us) { image_tx_inter_packet_us_ = us; }
 
     bool send_config(uint8_t key, uint32_t value);
     bool request_frequency_change(uint32_t frequency_hz);
+    // Gateway only: sweep every preset channel looking for a node and bring
+    // both sides back to preset[APP_FREQUENCY_RESET_TARGET_INDEX]. With
+    // `lora_wakeup` set, each channel is preceded by the LoRa long-preamble
+    // wakeup so a node sleeping in CAD can hear the probe. The result arrives
+    // via frequency_change_result_cb; the gateway always ends on the target
+    // channel, even when no node answered.
+    bool request_frequency_reset(bool lora_wakeup);
     bool set_initial_frequency(uint32_t frequency_hz);
     uint32_t current_frequency_hz() const { return current_frequency_hz_; }
 
@@ -147,9 +161,21 @@ private:
     bool apply_frequency(uint32_t frequency_hz);
     bool is_frequency_preset(uint32_t frequency_hz) const;
     bool change_frequency(uint32_t frequency_hz);
+    bool reset_frequency(bool lora_wakeup);
+    // Stage 1 of a frequency change on the current channel: send
+    // Config(FREQUENCY) up to `retries` times and wait for a matching ConfigAck.
+    bool send_frequency_config(uint16_t transaction_id, uint32_t frequency_hz, uint32_t retries);
+    // Stage 2 on the new channel: send FrequencyConfirm and wait for the node's
+    // FrequencyConfirmAck. Only a received ack counts as success.
+    bool send_frequency_confirm(uint16_t transaction_id, uint32_t frequency_hz);
+    // Pump radio IRQs while a foreground wait loop owns the radio task.
+    void service_irq_once();
+    uint16_t next_frequency_transaction_id();
     bool build_voice_packet(uint16_t *tx_size);
     void capture_voice_packet();
     void handle_rx_packet();
+    // Split one FIFO read into packets, verify each software CRC, dispatch.
+    void process_rx_chunk(uint16_t len, int16_t rssi);
     void dispatch_rx_packet(uint16_t len, int16_t rssi);
     void queue_voice_packet(uint16_t len, int16_t rssi);
     void log_rx(uint16_t seq, uint16_t len, int16_t rssi);
@@ -194,6 +220,7 @@ private:
     void check_image_rx_timeout();
     void check_image_rx_abort();
     bool send_config_ack(uint8_t key, uint32_t value, uint16_t transaction_id = 0);
+    bool send_frequency_confirm_ack(uint16_t transaction_id, uint32_t frequency_hz);
     void handle_frequency_config(uint16_t transaction_id, uint32_t frequency_hz);
     void handle_frequency_confirm(uint16_t transaction_id, uint32_t frequency_hz);
     void check_frequency_rollback();
@@ -280,6 +307,7 @@ private:
     config_received_cb_t config_received_cb_ = nullptr;
     frequency_committed_cb_t frequency_committed_cb_ = nullptr;
     frequency_change_result_cb_t frequency_change_result_cb_ = nullptr;
+    frequency_reset_progress_cb_t frequency_reset_progress_cb_ = nullptr;
     low_power_standby_cb_t low_power_standby_cb_ = nullptr;
     uint16_t image_session_id_ = 1;
     volatile bool image_tx_active_ = false;
@@ -299,6 +327,8 @@ private:
     bool image_req_active_ = false;
     uint16_t image_req_session_ = 0;
     uint32_t image_req_next_ms_ = 0;
+    // When the current request began; bounds total retry time (APP_IMAGE_REQ_TIMEOUT_MS).
+    uint32_t image_req_start_ms_ = 0;
     // End of the current low-power request round; unused in normal continuous retry mode.
     uint32_t image_req_round_end_ms_ = 0;
     uint32_t image_cmd_sent_ms_ = 0;
@@ -322,12 +352,18 @@ private:
     volatile bool frequency_change_active_ = false;
     volatile bool frequency_change_request_pending_ = false;
     uint32_t frequency_change_request_hz_ = APP_FLRC_FREQUENCY_HZ;
+    volatile bool frequency_reset_request_pending_ = false;
+    bool frequency_reset_request_wakeup_ = false;
     bool frequency_rollback_active_ = false;
     uint32_t current_frequency_hz_ = APP_FLRC_FREQUENCY_HZ;
     uint32_t frequency_previous_hz_ = APP_FLRC_FREQUENCY_HZ;
     uint32_t frequency_pending_hz_ = APP_FLRC_FREQUENCY_HZ;
     uint32_t frequency_rollback_deadline_ms_ = 0;
     uint16_t frequency_transaction_id_ = 0;
+    // Gateway: FrequencyConfirmAck received on the new channel.
+    volatile bool frequency_confirm_ack_received_ = false;
+    uint16_t frequency_confirm_ack_transaction_id_ = 0;
+    uint32_t frequency_confirm_ack_hz_ = 0;
 
     // Low power CAD state
     bool low_power_cad_active_ = false;

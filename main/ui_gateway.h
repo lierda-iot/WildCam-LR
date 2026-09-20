@@ -26,6 +26,10 @@ typedef bool (*ui_gw_pir_trigger_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_voice_alarm_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_low_power_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_frequency_cb_t)(uint32_t frequency_hz);
+// Sweep all channels and bring the node back to the default one. With
+// lora_wakeup the gateway sends the LoRa long preamble on every channel first
+// so a node sleeping in low-power CAD can hear the probe.
+typedef bool (*ui_gw_frequency_reset_cb_t)(bool lora_wakeup);
 typedef void (*ui_gw_wifi_prov_cb_t)(void);
 typedef void (*ui_gw_wifi_disconnect_cb_t)(void);
 // Called when the user leaves the transfer (RX) page: abort the current RX.
@@ -65,6 +69,7 @@ void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb);
 void ui_gw_set_voice_alarm_cb(ui_gw_voice_alarm_cb_t cb);
 void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb);
 void ui_gw_set_frequency_cb(ui_gw_frequency_cb_t cb);
+void ui_gw_set_frequency_reset_cb(ui_gw_frequency_reset_cb_t cb);
 void ui_gw_set_wifi_prov_cb(ui_gw_wifi_prov_cb_t cb);
 void ui_gw_set_wifi_disconnect_cb(ui_gw_wifi_disconnect_cb_t cb);
 void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb);
@@ -79,7 +84,11 @@ void ui_gw_hide_qr(void);
  * Call with 0 to hide. */
 void ui_gw_update_vbat(uint16_t vbat_mv);
 void ui_gw_set_current_frequency(uint32_t frequency_hz);
+// Non-blocking. frequency_hz is the gateway's actual channel afterwards and is
+// shown whether or not the change/reset succeeded.
 void ui_gw_frequency_result(bool success, uint32_t frequency_hz);
+// Non-blocking progress from the reset sweep (channel_index is 0-based).
+void ui_gw_frequency_reset_progress(uint8_t channel_index, uint8_t channel_count);
 
 #ifdef __cplusplus
 }
