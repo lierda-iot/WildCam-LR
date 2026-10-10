@@ -93,7 +93,7 @@ AM312 是被动式红外传感器，它检测视野内红外辐射的变化，�
 - 安装 ESP-IDF 安装程序提供的 Python 和编译工具。
 - 首次解析 ESP-IDF Component Manager 依赖时需要访问网络。
 
-项目目标芯片为 `esp32s3`，使用 8 MB Flash 和自定义分区表 `partitions.csv`。组件清单当前从 Espressif staging registry 获取 `lierda-iot/esp_lora_driver` `0.0.7`。
+项目目标芯片为 `esp32s3`，使用 8 MB Flash 和自定义分区表 `partitions.csv`。组件清单从 [ESP Component Registry](https://components.espressif.com/components/lierda-iot/esp_lora_driver) 获取 `lierda-iot/esp_lora_driver` `1.0.0`。
 
 ## 使用 VS Code 编译与烧录
 

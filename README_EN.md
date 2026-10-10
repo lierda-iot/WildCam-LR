@@ -93,7 +93,7 @@ The firmware arms `GPIO12` about 5 seconds after startup. A high output from the
 - Python and build tools installed by the ESP-IDF installer.
 - Internet access for ESP-IDF Component Manager dependencies.
 
-The project targets `esp32s3`, uses an 8 MB flash configuration, and uses `partitions.csv`. The component manifest currently obtains `lierda-iot/esp_lora_driver` version `0.0.7` from the Espressif staging registry.
+The project targets `esp32s3`, uses an 8 MB flash configuration, and uses `partitions.csv`. The component manifest obtains `lierda-iot/esp_lora_driver` version `1.0.0` from the [ESP Component Registry](https://components.espressif.com/components/lierda-iot/esp_lora_driver).
 
 ## Build and Flash with VS Code
 

@@ -4,6 +4,14 @@ All notable changes to AM36-WildCam are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/).
 
+## [1.0.6] - 2026-10-10
+
+- Switched the LR2021 driver dependency to `lierda-iot/esp_lora_driver`
+  1.0.0 from the ESP Component Registry, replacing the 0.0.7 staging
+  release. The driver recalibrates the radio after large frequency changes
+  and checks the radio state more strictly during initialization.
+- Updated `espressif/esp_sccb_intf` to 0.0.9 in the dependency lock file.
+
 ## [1.0.5] - 2026-09-20
 
 - Added Freq Reset and LP Freq Reset to the gateway Settings page to bring a

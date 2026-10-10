@@ -71,7 +71,7 @@ dependencies:
     - esp32c6
     version: 0.6.1
   espressif/esp_sccb_intf:
-    component_hash: c071b189e49f40940722aea01a5489f873385cc39cd5b14012341135b85d1a9d
+    component_hash: eb6a7d5c992f09583c163b2e3f5e95a0fdc87a2d9f8e026f3e59153935553889
     dependencies:
     - name: idf
       require: private
@@ -79,21 +79,21 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 0.0.8
+    version: 0.0.9
   idf:
     source:
       type: idf
     version: 5.5.3
   lierda-iot/esp_lora_driver:
-    component_hash: 19b26b89529bc67754cbb300f56c570eb550aad000c20c13cfdb41165262cd1b
+    component_hash: 83f8145b70e4b033c2d6da2d6a127b688973f82a181f6841072516125aafc371
     dependencies:
     - name: idf
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components-staging.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
-    version: 0.0.7
+    version: 1.0.0
   lvgl/lvgl:
     component_hash: d7c1ac037ae6e85d94897f807d6e7ba0946a83e720074fc95a4f6241da9f9f53
     dependencies: []
@@ -109,6 +109,6 @@ direct_dependencies:
 - idf
 - lierda-iot/esp_lora_driver
 - lvgl/lvgl
-manifest_hash: 6aa6a99cf8ec9dcc00d5e9c432ee319ec8ca9e9eda7c4ec3da36fa259b3fc4f9
+manifest_hash: ab741be8728985a3df2c4f848025e7b3103146fd50a2f7880f64b841600d1be9
 target: esp32s3
 version: 2.0.0
