@@ -1,3 +1,11 @@
+# IDF 6.0 removed wifi_provisioning from IDF; it was renamed network_provisioning
+# and moved to the component registry. Keep both IDF lines building from one tree.
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    set(APP_PROV_COMPONENT espressif__network_provisioning)
+else()
+    set(APP_PROV_COMPONENT wifi_provisioning)
+endif()
+
 idf_component_register(SRCS
                            "app_main.cpp"
                            "audio_diagnostics.cpp"
@@ -38,6 +46,6 @@ idf_component_register(SRCS
                            esp_wifi
                            esp_netif
                            lwip
-                           wifi_provisioning
+                           ${APP_PROV_COMPONENT}
                            protocomm
                            esp_http_server)

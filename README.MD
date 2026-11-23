@@ -89,7 +89,7 @@ AM312 是被动式红外传感器，它检测视野内红外辐射的变化，�
 - 建议准备两套利尔达 L-LRMAM36-FANN4-DK01 开发套件，分别作为网关和拍摄端。
 - 如需人体/动物移动触发，准备一个外接 AM312 PIR 模块。
 - USB 数据线及所需的 USB 转串口驱动。
-- 必须使用 [ESP-IDF](https://github.com/espressif/esp-idf) v5.5.3。
+- 必须使用 [ESP-IDF](https://github.com/espressif/esp-idf) v5.5.3 或 v6.0。
 - 安装 ESP-IDF 安装程序提供的 Python 和编译工具。
 - 首次解析 ESP-IDF Component Manager 依赖时需要访问网络。
 
@@ -99,7 +99,7 @@ AM312 是被动式红外传感器，它检测视野内红外辐射的变化，�
 
 1. 克隆仓库并使用 Visual Studio Code 打开仓库根目录。
 2. 在 VS Code 扩展市场安装 Espressif 官方 ESP-IDF 扩展。
-3. 在扩展提示时选择已安装的 ESP-IDF v5.5.3 环境。本机安装路径不会写入仓库。
+3. 在扩展提示时选择已安装的 ESP-IDF v5.5.3 或 v6.0 环境。本机安装路径不会写入仓库。
 4. 点击状态栏中的 ESP-IDF **Build** 图标。
 5. 连接开发板，在 ESP-IDF 状态栏选择串口，然后点击 **Flash**；使用 **Monitor** 查看串口输出。
 
@@ -107,7 +107,7 @@ ESP-IDF 工程配置由仓库中的 CMake、`sdkconfig` 和 `sdkconfig.defaults`
 
 ## 使用终端编译与烧录
 
-在项目目录中打开 ESP-IDF v5.5.3 终端。
+在项目目录中打开 ESP-IDF v5.5.3 或 v6.0 终端。
 
 仓库中的 `sdkconfig.defaults` 会在重新生成 `sdkconfig` 时保留 ESP32-S3 目标、240 MHz CPU、8 MB DIO Flash、自定义分区表、Octal PSRAM 和面向发布的编译优化配置。
 

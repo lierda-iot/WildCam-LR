@@ -89,7 +89,7 @@ The firmware arms `GPIO12` about 5 seconds after startup. A high output from the
 - Two Lierda L-LRMAM36-FANN4-DK01 development kits are recommended: one gateway and one field node.
 - An external AM312 PIR module is required for human/animal motion-triggered capture.
 - USB data cables and the required USB-to-serial driver.
-- [ESP-IDF](https://github.com/espressif/esp-idf) v5.5.3 is required.
+- [ESP-IDF](https://github.com/espressif/esp-idf) v5.5.3 or v6.0 is required.
 - Python and build tools installed by the ESP-IDF installer.
 - Internet access for ESP-IDF Component Manager dependencies.
 
@@ -99,7 +99,7 @@ The project targets `esp32s3`, uses an 8 MB flash configuration, and uses `parti
 
 1. Clone the repository and open its root folder in Visual Studio Code.
 2. Install the official Espressif ESP-IDF extension from the VS Code Marketplace.
-3. Select an installed ESP-IDF v5.5.3 setup when the extension asks for one. This machine-specific path is intentionally not stored in the repository.
+3. Select an installed ESP-IDF v5.5.3 or v6.0 setup when the extension asks for one. This machine-specific path is intentionally not stored in the repository.
 4. Click the ESP-IDF **Build** icon in the status bar.
 5. Connect the board, select its serial port in the ESP-IDF status bar, and click **Flash**. Use **Monitor** to view serial output.
 
@@ -107,7 +107,7 @@ The ESP-IDF project setup is supplied by the checked-in CMake files, `sdkconfig`
 
 ## Build and Flash from a Terminal
 
-Open an ESP-IDF v5.5.3 terminal in the project directory.
+Open an ESP-IDF v5.5.3 or v6.0 terminal in the project directory.
 
 The checked-in `sdkconfig.defaults` preserves the required ESP32-S3 target, 240 MHz CPU setting, 8 MB DIO flash configuration, custom partition table, Octal PSRAM configuration, and release-oriented compiler optimization when `sdkconfig` is regenerated.
 

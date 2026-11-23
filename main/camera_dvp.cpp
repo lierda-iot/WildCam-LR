@@ -13,6 +13,7 @@
 #include "esp_cam_ctlr_dvp.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "bsp.h"
 
@@ -34,7 +35,13 @@ constexpr int kCaptureFrameNumber = 2;
 
 #if APP_CAMERA_COLOR_ENABLE
 constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
+#if ESP_IDF_VERSION_MAJOR >= 6
+/* IDF 6.0 replaced the byte-order agnostic CAM_CTLR_COLOR_YUV422 with explicit
+ * variants; the SP0A39 is configured for UYVY, matching kOutputPixelformat. */
+constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_YUV422_UYVY;
+#else
 constexpr cam_ctlr_color_t kDvpInputColor = CAM_CTLR_COLOR_YUV422;
+#endif
 constexpr uint32_t kOutputPixelformat = kFourccUyvy;
 #else
 constexpr uint32_t kDvpCaptureWidth = APP_CAMERA_SENSOR_WIDTH;
@@ -388,6 +395,12 @@ esp_err_t CameraUartStreamer::ensure_dvp_ready()
     dvp_cfg.h_res = kDvpCaptureWidth;
     dvp_cfg.v_res = APP_CAMERA_SENSOR_HEIGHT;
     dvp_cfg.input_data_color_type = kDvpInputColor;
+#if ESP_IDF_VERSION_MAJOR >= 6
+    /* IDF 6.0 turns on the LCD_CAM colour converter whenever the output type
+     * differs from the input one, and a zero output type selects YUV to RGB.
+     * Keep them equal so frames arrive exactly as the sensor sends them. */
+    dvp_cfg.output_data_color_type = kDvpInputColor;
+#endif
     dvp_cfg.pin = &pins;
     dvp_cfg.xclk_freq = APP_SP0A39_MCLK_HZ;
     dvp_cfg.dma_burst_size = 64;

@@ -109,6 +109,6 @@ direct_dependencies:
 - idf
 - lierda-iot/esp_lora_driver
 - lvgl/lvgl
-manifest_hash: ab741be8728985a3df2c4f848025e7b3103146fd50a2f7880f64b841600d1be9
+manifest_hash: 2f31bd508b6fd4d61ac8cbaf410bada54864587a2808c18a5c1f344711c6964f
 target: esp32s3
 version: 2.0.0

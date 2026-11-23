@@ -9,8 +9,32 @@
 #include "esp_http_server.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR >= 6
+/* IDF 6.0 renamed wifi_provisioning to network_provisioning and moved it to the
+ * component registry. Map the old names so the logic below stays version-agnostic. */
+#include "network_provisioning/manager.h"
+#include "network_provisioning/scheme_softap.h"
+#define WIFI_PROV_EVENT                          NETWORK_PROV_EVENT
+#define WIFI_PROV_CRED_RECV                      NETWORK_PROV_WIFI_CRED_RECV
+#define WIFI_PROV_CRED_SUCCESS                   NETWORK_PROV_WIFI_CRED_SUCCESS
+#define WIFI_PROV_CRED_FAIL                      NETWORK_PROV_WIFI_CRED_FAIL
+#define WIFI_PROV_END                            NETWORK_PROV_END
+#define WIFI_PROV_EVENT_HANDLER_NONE             NETWORK_PROV_EVENT_HANDLER_NONE
+#define WIFI_PROV_SECURITY_1                     NETWORK_PROV_SECURITY_1
+#define wifi_prov_security_t                     network_prov_security_t
+#define wifi_prov_mgr_config_t                   network_prov_mgr_config_t
+#define wifi_prov_scheme_softap                  network_prov_scheme_softap
+#define wifi_prov_scheme_softap_set_httpd_handle network_prov_scheme_softap_set_httpd_handle
+#define wifi_prov_mgr_init                       network_prov_mgr_init
+#define wifi_prov_mgr_deinit                     network_prov_mgr_deinit
+#define wifi_prov_mgr_start_provisioning         network_prov_mgr_start_provisioning
+#define wifi_prov_mgr_stop_provisioning          network_prov_mgr_stop_provisioning
+#define wifi_prov_mgr_reset_sm_state_on_failure  network_prov_mgr_reset_wifi_sm_state_on_failure
+#else
 #include "wifi_provisioning/manager.h"
 #include "wifi_provisioning/scheme_softap.h"
+#endif
 #include <string.h>
 #include <stdio.h>
 

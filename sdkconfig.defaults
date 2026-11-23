@@ -14,6 +14,11 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # CONFIG_COMPILER_OPTIMIZATION_PERF is not set
 # CONFIG_COMPILER_OPTIMIZATION_NONE is not set
 
+# IDF 6.0 defaults CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS to N, which promotes
+# third-party component warnings to errors. Keep the 5.5.3 behaviour so a
+# regenerated sdkconfig builds the same way on both IDF lines.
+CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
+
 # LR2021 radio driver (esp_lora_driver)
 CONFIG_SMTC_RADIO_LR20XX=y
 CONFIG_LIERDA_BOARD_LRMAM36_FANN4=y

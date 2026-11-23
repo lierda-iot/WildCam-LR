@@ -2,8 +2,14 @@
 dependencies:
   78/esp-opus: ^1.0.5
   lierda-iot/esp_lora_driver: "1.0.0"
-  idf: "5.5.3"
+  idf: ">=5.5.3"
   lvgl/lvgl: ^8.4.0
   espressif/esp_new_jpeg: "^0.6.0"
   espressif/esp_cam_sensor: "^1.1.0"
   espressif/esp_image_effects: "^1.0.0"
+  # IDF 6.0 dropped the built-in wifi_provisioning component; its successor
+  # lives in the registry and is only pulled in on IDF 6 and newer.
+  espressif/network_provisioning:
+    version: "^1.2.4"
+    rules:
+      - if: "idf_version >=6.0"
